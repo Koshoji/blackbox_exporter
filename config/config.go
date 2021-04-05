@@ -68,6 +68,7 @@ var (
 	// DefaultDNSProbe set default value for DNSProbe
 	DefaultDNSProbe = DNSProbe{
 		IPProtocolFallback: true,
+		RecursionDesired:   true,
 	}
 )
 
@@ -233,6 +234,7 @@ type DNSProbe struct {
 	ValidateAnswer     DNSRRValidator   `yaml:"validate_answer_rrs,omitempty"`
 	ValidateAuthority  DNSRRValidator   `yaml:"validate_authority_rrs,omitempty"`
 	ValidateAdditional DNSRRValidator   `yaml:"validate_additional_rrs,omitempty"`
+	RecursionDesired   bool             `yaml:"recursion_desired,omitempty"`
 }
 
 type DNSRRValidator struct {
