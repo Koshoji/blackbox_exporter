@@ -25,7 +25,7 @@ func TestLoadConfig(t *testing.T) {
 		C: &Config{},
 	}
 
-	err := sc.ReloadConfig("testdata/blackbox-good.yml")
+	err := sc.ReloadConfig("testdata/blackbox-good.yml", nil)
 	if err != nil {
 		t.Errorf("Error loading config %v: %v", "blackbox.yml", err)
 	}
@@ -76,13 +76,21 @@ func TestLoadBadConfigs(t *testing.T) {
 			want:  `error parsing config file: "Could not compile regular expression" regexp=":["`,
 		},
 		{
+			input: "testdata/invalid-http-compression-mismatch.yml",
+			want:  `error parsing config file: invalid configuration "Accept-Encoding: deflate", "compression: gzip"`,
+		},
+		{
+			input: "testdata/invalid-http-request-compression-reject-all-encodings.yml",
+			want:  `error parsing config file: invalid configuration "Accept-Encoding: *;q=0.0", "compression: gzip"`,
+		},
+		{
 			input: "testdata/invalid-tcp-query-response-regexp.yml",
 			want:  `error parsing config file: "Could not compile regular expression" regexp=":["`,
 		},
 	}
 	for _, test := range tests {
 		t.Run(test.input, func(t *testing.T) {
-			got := sc.ReloadConfig(test.input)
+			got := sc.ReloadConfig(test.input, nil)
 			if got == nil || got.Error() != test.want {
 				t.Fatalf("ReloadConfig(%q) = %v; want %q", test.input, got, test.want)
 			}
@@ -95,7 +103,7 @@ func TestHideConfigSecrets(t *testing.T) {
 		C: &Config{},
 	}
 
-	err := sc.ReloadConfig("testdata/blackbox-good.yml")
+	err := sc.ReloadConfig("testdata/blackbox-good.yml", nil)
 	if err != nil {
 		t.Errorf("Error loading config %v: %v", "testdata/blackbox-good.yml", err)
 	}
@@ -109,5 +117,88 @@ func TestHideConfigSecrets(t *testing.T) {
 	}
 	if strings.Contains(string(c), "mysecret") {
 		t.Fatal("config's String method reveals authentication credentials.")
+	}
+}
+
+func TestIsEncodingAcceptable(t *testing.T) {
+	testcases := map[string]struct {
+		input          string
+		acceptEncoding string
+		expected       bool
+	}{
+		"empty compression": {
+			input:          "",
+			acceptEncoding: "gzip",
+			expected:       true,
+		},
+		"trivial": {
+			input:          "gzip",
+			acceptEncoding: "gzip",
+			expected:       true,
+		},
+		"trivial, quality": {
+			input:          "gzip",
+			acceptEncoding: "gzip;q=1.0",
+			expected:       true,
+		},
+		"first": {
+			input:          "gzip",
+			acceptEncoding: "gzip, compress",
+			expected:       true,
+		},
+		"second": {
+			input:          "gzip",
+			acceptEncoding: "compress, gzip",
+			expected:       true,
+		},
+		"missing": {
+			input:          "br",
+			acceptEncoding: "gzip, compress",
+			expected:       false,
+		},
+		"*": {
+			input:          "br",
+			acceptEncoding: "gzip, compress, *",
+			expected:       true,
+		},
+		"* with quality": {
+			input:          "br",
+			acceptEncoding: "gzip, compress, *;q=0.1",
+			expected:       true,
+		},
+		"rejected": {
+			input:          "br",
+			acceptEncoding: "gzip, compress, br;q=0.0",
+			expected:       false,
+		},
+		"rejected *": {
+			input:          "br",
+			acceptEncoding: "gzip, compress, *;q=0.0",
+			expected:       false,
+		},
+		"complex": {
+			input:          "br",
+			acceptEncoding: "gzip;q=1.0, compress;q=0.5, br;q=0.1, *;q=0.0",
+			expected:       true,
+		},
+		"complex out of order": {
+			input:          "br",
+			acceptEncoding: "*;q=0.0, compress;q=0.5, br;q=0.1, gzip;q=1.0",
+			expected:       true,
+		},
+		"complex with extra blanks": {
+			input:          "br",
+			acceptEncoding: " gzip;q=1.0, compress; q=0.5, br;q=0.1, *; q=0.0 ",
+			expected:       true,
+		},
+	}
+
+	for name, tc := range testcases {
+		t.Run(name, func(t *testing.T) {
+			actual := isCompressionAcceptEncodingValid(tc.input, tc.acceptEncoding)
+			if actual != tc.expected {
+				t.Errorf("Unexpected result: input=%q acceptEncoding=%q expected=%t actual=%t", tc.input, tc.acceptEncoding, tc.expected, actual)
+			}
+		})
 	}
 }

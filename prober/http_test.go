@@ -15,6 +15,8 @@ package prober
 
 import (
 	"bytes"
+	"compress/flate"
+	"compress/gzip"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -29,6 +31,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/andybalholm/brotli"
 	"github.com/go-kit/kit/log"
 	"github.com/prometheus/client_golang/prometheus"
 	pconfig "github.com/prometheus/common/config"
@@ -101,6 +104,7 @@ func TestValidHTTPVersion(t *testing.T) {
 
 func TestContentLength(t *testing.T) {
 	type testdata struct {
+		msg                    []byte
 		contentLength          int
 		uncompressedBodyLength int
 		handler                http.HandlerFunc
@@ -113,6 +117,7 @@ func TestContentLength(t *testing.T) {
 
 	testcases := map[string]testdata{
 		"identity": {
+			msg:                    testmsg,
 			contentLength:          len(testmsg),
 			uncompressedBodyLength: len(testmsg),
 			handler: func(w http.ResponseWriter, r *http.Request) {
@@ -123,6 +128,7 @@ func TestContentLength(t *testing.T) {
 		},
 
 		"no content-encoding": {
+			msg:                    testmsg,
 			contentLength:          len(testmsg),
 			uncompressedBodyLength: len(testmsg),
 			handler: func(w http.ResponseWriter, r *http.Request) {
@@ -133,6 +139,7 @@ func TestContentLength(t *testing.T) {
 
 		// Unknown Content-Encoding, we should let this pass thru.
 		"unknown content-encoding": {
+			msg:                    testmsg,
 			contentLength:          len(testmsg),
 			uncompressedBodyLength: len(testmsg),
 			handler: func(w http.ResponseWriter, r *http.Request) {
@@ -145,6 +152,7 @@ func TestContentLength(t *testing.T) {
 		// 401 response, verify that the content-length is still computed correctly.
 		"401": {
 			expectFailure:          true,
+			msg:                    notfoundMsg,
 			contentLength:          len(notfoundMsg),
 			uncompressedBodyLength: len(notfoundMsg),
 			handler: func(w http.ResponseWriter, r *http.Request) {
@@ -153,6 +161,64 @@ func TestContentLength(t *testing.T) {
 				w.Write(notfoundMsg)
 			},
 		},
+
+		// Compressed payload _without_ compression setting, it should not be decompressed.
+		"brotli": func() testdata {
+			msg := testmsg
+			var buf bytes.Buffer
+			fw := brotli.NewWriter(&buf)
+			fw.Write([]byte(msg))
+			fw.Close()
+			return testdata{
+				msg:                    msg,
+				contentLength:          len(buf.Bytes()), // Content lenght is the length of the compressed buffer.
+				uncompressedBodyLength: len(buf.Bytes()), // No decompression.
+				handler: func(w http.ResponseWriter, r *http.Request) {
+					w.Header().Add("Content-Encoding", "br")
+					w.WriteHeader(http.StatusOK)
+					w.Write(buf.Bytes())
+				},
+			}
+		}(),
+
+		// Compressed payload _without_ compression setting, it should not be decompressed.
+		"deflate": func() testdata {
+			msg := testmsg
+			var buf bytes.Buffer
+			// the only error path is an invalid compression level
+			fw, _ := flate.NewWriter(&buf, flate.DefaultCompression)
+			fw.Write([]byte(msg))
+			fw.Close()
+			return testdata{
+				msg:                    msg,
+				contentLength:          len(buf.Bytes()), // Content lenght is the length of the compressed buffer.
+				uncompressedBodyLength: len(buf.Bytes()), // No decompression.
+				handler: func(w http.ResponseWriter, r *http.Request) {
+					w.Header().Add("Content-Encoding", "deflate")
+					w.WriteHeader(http.StatusOK)
+					w.Write(buf.Bytes())
+				},
+			}
+		}(),
+
+		// Compressed payload _without_ compression setting, it should not be decompressed.
+		"gzip": func() testdata {
+			msg := testmsg
+			var buf bytes.Buffer
+			gw := gzip.NewWriter(&buf)
+			gw.Write([]byte(msg))
+			gw.Close()
+			return testdata{
+				msg:                    msg,
+				contentLength:          len(buf.Bytes()), // Content lenght is the length of the compressed buffer.
+				uncompressedBodyLength: len(buf.Bytes()), // No decompression.
+				handler: func(w http.ResponseWriter, r *http.Request) {
+					w.Header().Add("Content-Encoding", "gzip")
+					w.WriteHeader(http.StatusOK)
+					w.Write(buf.Bytes())
+				},
+			}
+		}(),
 	}
 
 	for name, tc := range testcases {
@@ -193,6 +259,260 @@ func TestContentLength(t *testing.T) {
 	}
 }
 
+// TestHandlingOfCompressionSetting verifies that the "compression"
+// setting is handled correctly: content is decompressed only if
+// compression is specified, and only the specified compression
+// algorithm is handled.
+func TestHandlingOfCompressionSetting(t *testing.T) {
+	type testdata struct {
+		contentLength          int
+		uncompressedBodyLength int
+		handler                http.HandlerFunc
+		expectFailure          bool
+		httpConfig             config.HTTPProbe
+	}
+
+	testmsg := []byte(strings.Repeat("hello world", 10))
+
+	testcases := map[string]testdata{
+		"gzip": func() testdata {
+			msg := testmsg
+			var buf bytes.Buffer
+			enc := gzip.NewWriter(&buf)
+			enc.Write(msg)
+			enc.Close()
+			return testdata{
+				contentLength:          buf.Len(), // Content lenght is the length of the compressed buffer.
+				uncompressedBodyLength: len(msg),
+				handler: func(w http.ResponseWriter, r *http.Request) {
+					w.Header().Add("Content-Encoding", "gzip")
+					w.WriteHeader(http.StatusOK)
+					w.Write(buf.Bytes())
+				},
+				httpConfig: config.HTTPProbe{
+					IPProtocolFallback: true,
+					Compression:        "gzip",
+				},
+			}
+		}(),
+
+		"brotli": func() testdata {
+			msg := testmsg
+			var buf bytes.Buffer
+			enc := brotli.NewWriter(&buf)
+			enc.Write(msg)
+			enc.Close()
+			return testdata{
+				contentLength:          len(buf.Bytes()), // Content lenght is the length of the compressed buffer.
+				uncompressedBodyLength: len(msg),
+				handler: func(w http.ResponseWriter, r *http.Request) {
+					w.Header().Add("Content-Encoding", "br")
+					w.WriteHeader(http.StatusOK)
+					w.Write(buf.Bytes())
+				},
+				httpConfig: config.HTTPProbe{
+					IPProtocolFallback: true,
+					Compression:        "br",
+				},
+			}
+		}(),
+
+		"deflate": func() testdata {
+			msg := testmsg
+			var buf bytes.Buffer
+			// the only error path is an invalid compression level
+			enc, _ := flate.NewWriter(&buf, flate.DefaultCompression)
+			enc.Write(msg)
+			enc.Close()
+			return testdata{
+				contentLength:          len(buf.Bytes()), // Content lenght is the length of the compressed buffer.
+				uncompressedBodyLength: len(msg),
+				handler: func(w http.ResponseWriter, r *http.Request) {
+					w.Header().Add("Content-Encoding", "deflate")
+					w.WriteHeader(http.StatusOK)
+					w.Write(buf.Bytes())
+				},
+				httpConfig: config.HTTPProbe{
+					IPProtocolFallback: true,
+					Compression:        "deflate",
+				},
+			}
+		}(),
+
+		"identity": {
+			contentLength:          len(testmsg),
+			uncompressedBodyLength: len(testmsg),
+			handler: func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Add("Content-Encoding", "identity")
+				w.WriteHeader(http.StatusOK)
+				w.Write(testmsg)
+			},
+			httpConfig: config.HTTPProbe{
+				IPProtocolFallback: true,
+				Compression:        "identity",
+			},
+		},
+
+		// We do exactly as told: the server is returning a
+		// gzip-encoded response, but the module is expecting a
+		// delfate-encoded response. This should fail.
+		"compression encoding mismatch": func() testdata {
+			msg := testmsg
+			var buf bytes.Buffer
+			enc := gzip.NewWriter(&buf)
+			enc.Write(msg)
+			enc.Close()
+			return testdata{
+				expectFailure:          true,
+				contentLength:          buf.Len(), // Content lenght is the length of the compressed buffer.
+				uncompressedBodyLength: 0,
+				handler: func(w http.ResponseWriter, r *http.Request) {
+					w.Header().Add("Content-Encoding", "gzip")
+					w.WriteHeader(http.StatusOK)
+					w.Write(buf.Bytes())
+				},
+				httpConfig: config.HTTPProbe{
+					IPProtocolFallback: true,
+					Compression:        "deflate",
+				},
+			}
+		}(),
+
+		"accept gzip": func() testdata {
+			msg := testmsg
+			var buf bytes.Buffer
+			enc := gzip.NewWriter(&buf)
+			enc.Write(msg)
+			enc.Close()
+			return testdata{
+				expectFailure:          false,
+				contentLength:          buf.Len(), // Content lenght is the length of the compressed buffer.
+				uncompressedBodyLength: len(msg),
+				handler: func(w http.ResponseWriter, r *http.Request) {
+					w.Header().Add("Content-Encoding", "gzip")
+					w.WriteHeader(http.StatusOK)
+					w.Write(buf.Bytes())
+				},
+				httpConfig: config.HTTPProbe{
+					IPProtocolFallback: true,
+					Compression:        "gzip",
+					Headers: map[string]string{
+						"Accept-Encoding": "gzip",
+					},
+				},
+			}
+		}(),
+
+		"accept br, gzip": func() testdata {
+			msg := testmsg
+			var buf bytes.Buffer
+			enc := gzip.NewWriter(&buf)
+			enc.Write(msg)
+			enc.Close()
+			return testdata{
+				expectFailure:          false,
+				contentLength:          buf.Len(), // Content lenght is the length of the compressed buffer.
+				uncompressedBodyLength: len(msg),
+				handler: func(w http.ResponseWriter, r *http.Request) {
+					w.Header().Add("Content-Encoding", "gzip")
+					w.WriteHeader(http.StatusOK)
+					w.Write(buf.Bytes())
+				},
+				httpConfig: config.HTTPProbe{
+					IPProtocolFallback: true,
+					Compression:        "gzip",
+					Headers: map[string]string{
+						"Accept-Encoding": "br, gzip",
+					},
+				},
+			}
+		}(),
+
+		"accept anything": func() testdata {
+			msg := testmsg
+			var buf bytes.Buffer
+			enc := gzip.NewWriter(&buf)
+			enc.Write(msg)
+			enc.Close()
+			return testdata{
+				expectFailure:          false,
+				contentLength:          buf.Len(), // Content lenght is the length of the compressed buffer.
+				uncompressedBodyLength: len(msg),
+				handler: func(w http.ResponseWriter, r *http.Request) {
+					w.Header().Add("Content-Encoding", "gzip")
+					w.WriteHeader(http.StatusOK)
+					w.Write(buf.Bytes())
+				},
+				httpConfig: config.HTTPProbe{
+					IPProtocolFallback: true,
+					Compression:        "gzip",
+					Headers: map[string]string{
+						"Accept-Encoding": "*",
+					},
+				},
+			}
+		}(),
+
+		"compressed content without compression setting": func() testdata {
+			msg := testmsg
+			var buf bytes.Buffer
+			enc := gzip.NewWriter(&buf)
+			enc.Write(msg)
+			enc.Close()
+			return testdata{
+				expectFailure:          false,
+				contentLength:          buf.Len(),
+				uncompressedBodyLength: buf.Len(), // content won't be uncompressed
+				handler: func(w http.ResponseWriter, r *http.Request) {
+					w.Header().Add("Content-Encoding", "gzip")
+					w.WriteHeader(http.StatusOK)
+					w.Write(buf.Bytes())
+				},
+				httpConfig: config.HTTPProbe{
+					IPProtocolFallback: true,
+				},
+			}
+		}(),
+	}
+
+	for name, tc := range testcases {
+		t.Run(name, func(t *testing.T) {
+			ts := httptest.NewServer(tc.handler)
+			defer ts.Close()
+
+			testCTX, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+
+			registry := prometheus.NewRegistry()
+			var logbuf bytes.Buffer
+			result := ProbeHTTP(testCTX,
+				ts.URL,
+				config.Module{
+					Timeout: time.Second,
+					HTTP:    tc.httpConfig,
+				},
+				registry,
+				log.NewLogfmtLogger(&logbuf))
+			if !tc.expectFailure && !result {
+				t.Fatalf("probe failed unexpectedly: %s", logbuf.String())
+			} else if tc.expectFailure && result {
+				t.Fatalf("probe succeeded unexpectedly: %s", logbuf.String())
+			}
+
+			mfs, err := registry.Gather()
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			expectedResults := map[string]float64{
+				"probe_http_content_length":           float64(tc.contentLength),
+				"probe_http_uncompressed_body_length": float64(tc.uncompressedBodyLength),
+			}
+			checkRegistryResults(expectedResults, mfs, t)
+		})
+	}
+}
+
 func TestRedirectFollowed(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/" {
@@ -206,7 +526,7 @@ func TestRedirectFollowed(t *testing.T) {
 	registry := prometheus.NewRegistry()
 	testCTX, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	result := ProbeHTTP(testCTX, ts.URL, config.Module{Timeout: time.Second, HTTP: config.HTTPProbe{IPProtocolFallback: true}}, registry, log.NewNopLogger())
+	result := ProbeHTTP(testCTX, ts.URL, config.Module{Timeout: time.Second, HTTP: config.HTTPProbe{IPProtocolFallback: true, HTTPClientConfig: pconfig.DefaultHTTPClientConfig}}, registry, log.NewNopLogger())
 	body := recorder.Body.String()
 	if !result {
 		t.Fatalf("Redirect test failed unexpectedly, got %s", body)
@@ -234,7 +554,7 @@ func TestRedirectNotFollowed(t *testing.T) {
 	testCTX, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	result := ProbeHTTP(testCTX, ts.URL,
-		config.Module{Timeout: time.Second, HTTP: config.HTTPProbe{IPProtocolFallback: true, NoFollowRedirects: true, ValidStatusCodes: []int{302}}}, registry, log.NewNopLogger())
+		config.Module{Timeout: time.Second, HTTP: config.HTTPProbe{IPProtocolFallback: true, HTTPClientConfig: pconfig.HTTPClientConfig{FollowRedirects: false}, ValidStatusCodes: []int{302}}}, registry, log.NewNopLogger())
 	body := recorder.Body.String()
 	if !result {
 		t.Fatalf("Redirect test failed unexpectedly, got %s", body)
@@ -281,7 +601,7 @@ func TestRedirectionLimit(t *testing.T) {
 	result := ProbeHTTP(
 		testCTX,
 		ts.URL,
-		config.Module{Timeout: time.Second, HTTP: config.HTTPProbe{IPProtocolFallback: true}},
+		config.Module{Timeout: time.Second, HTTP: config.HTTPProbe{IPProtocolFallback: true, HTTPClientConfig: pconfig.DefaultHTTPClientConfig}},
 		registry,
 		log.NewNopLogger())
 	if result {
@@ -816,7 +1136,7 @@ func TestRedirectToTLSHostWorks(t *testing.T) {
 	testCTX, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	result := ProbeHTTP(testCTX, ts.URL,
-		config.Module{Timeout: time.Second, HTTP: config.HTTPProbe{IPProtocolFallback: true}}, registry, log.NewNopLogger())
+		config.Module{Timeout: time.Second, HTTP: config.HTTPProbe{IPProtocolFallback: true, HTTPClientConfig: pconfig.DefaultHTTPClientConfig}}, registry, log.NewNopLogger())
 	if !result {
 		t.Fatalf("Redirect test failed unexpectedly")
 	}
@@ -889,7 +1209,7 @@ func TestCookieJar(t *testing.T) {
 	registry := prometheus.NewRegistry()
 	testCTX, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	result := ProbeHTTP(testCTX, ts.URL, config.Module{Timeout: time.Second, HTTP: config.HTTPProbe{IPProtocolFallback: true}}, registry, log.NewNopLogger())
+	result := ProbeHTTP(testCTX, ts.URL, config.Module{Timeout: time.Second, HTTP: config.HTTPProbe{IPProtocolFallback: true, HTTPClientConfig: pconfig.DefaultHTTPClientConfig}}, registry, log.NewNopLogger())
 	body := recorder.Body.String()
 	if !result {
 		t.Fatalf("Redirect test failed unexpectedly, got %s", body)
